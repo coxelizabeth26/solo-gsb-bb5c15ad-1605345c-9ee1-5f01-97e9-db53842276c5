@@ -1,9 +1,11 @@
 """核心模拟引擎：在单个 IMMEDIATE 事务中完成匹配、渲染、状态推进。
 
-同一会话快照还支持**预演**（``preview_session``）：在只读事务中复用
-路由匹配、条件判定与模板渲染的同一份代码，产出拟响应与 state/context
-差异，但全程回滚、不写任何表；即使模板调用 ``seq()``，计数器也只在
-一次性的渲染器实例内自增，随后的真实请求仍看到预演前的值。
+同一会话快照还支持**预演**（``preview_session`` / ``preview_chain``）：在只读
+事务中复用路由匹配、条件判定与模板渲染的同一份代码。单次预演产出拟响应与
+state/context 差异；请求链预演（``preview_chain``）从同一快照出发依次执行
+有序请求，后一步看到前一步拟产生的 state/context/seq 变化，任一匹配或渲染
+失败即停止。两种预演全程回滚、不写任何表；即使模板调用 ``seq()``，计数器
+也只在一次性的渲染器实例内自增，随后的真实请求仍看到预演前的值。
 """
 from __future__ import annotations
 
@@ -413,6 +415,9 @@ def _run_locked(conn, token, method, path, query, headers, body,
 # 请求预演：只读快照、同一份匹配/渲染逻辑、零持久化副作用
 # ---------------------------------------------------------------------------
 
+MAX_PREVIEW_STEPS = 50
+
+
 def _build_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     """以 after 相对 before 的视角生成 added/changed/removed 差异（跳过 _seq）。"""
     added: dict[str, Any] = {}
@@ -433,6 +438,89 @@ def _build_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]
         "changed": changed,
         "removed": sorted(removed),
     }
+
+
+def _build_seq_preview(context: dict[str, Any], counters: dict[str, int],
+                       seq_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """以 context（步骤前快照）为基准，给本次渲染内的每次 seq() 调用标注 before。"""
+    prior = context.get("_seq", {}) or {}
+    return [
+        {
+            **call,
+            "before": prior.get(call["name"]),
+            "note": "仅预演内自增，不会持久化；随后真实请求仍从预演前的计数开始",
+        }
+        for call in seq_calls
+    ]
+
+
+def _simulate_step(scenario: Scenario, scenario_name: str, *, state: str,
+                   context: dict[str, Any], method: str, path: str,
+                   query: dict[str, Any], headers: dict[str, Any],
+                   body: Any) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """在内存快照上执行一次匹配/渲染（真实与预演共用的同一套语义）。
+
+    纯函数：不触碰数据库。返回 (本步结构化结果, 拟产生的下一状态,
+    拟产生的下一上下文（含 _seq 计数器）)。路由不匹配、无命中规则或
+    渲染失败时抛出 :class:`SimAbort`（与真实引擎的状态码/错误体一致）。
+    """
+    route, path_params, trace = _match_routes(scenario, method, path)
+
+    bag = {"state": state, "body": body, "query": query,
+           "header": headers, "path": path_params}
+    rule, rule_trace = evaluate_rules_traced(route.rules, bag)
+    trace += rule_trace
+
+    if rule is None:
+        raise SimAbort(409, {
+            "error": "no_matching_rule",
+            "scenario": scenario_name,
+            "route": route.id,
+            "state": state,
+            "trace": trace,
+        }, trace=trace)
+
+    planned = _plan_matched(scenario, scenario_name, route, path_params, rule,
+                            state=state, context=context, method=method, path=path,
+                            body=body, query=query, headers=headers, trace=trace)
+
+    step = {
+        "matched": {
+            "scenario": planned.scenario_name,
+            "route": planned.route.id,
+            "rule": planned.rule.name,
+            "path_params": planned.path_params,
+        },
+        "request": {
+            "method": method,
+            "path": path,
+            "query": query,
+            "headers": headers,
+            "body": body,
+        },
+        "response": {
+            "status_code": planned.status_code,
+            "headers": planned.headers,
+            "body": planned.body,
+            "delay_ms": planned.delay_ms,
+        },
+        "state_diff": {"before": planned.state, "after": planned.next_state,
+                       "changed": planned.state != planned.next_state},
+        "context_diff": _build_diff(planned.context, planned.new_context),
+        "seq_preview": _build_seq_preview(planned.context, planned.counters,
+                                          planned.seq_calls),
+        "trace": planned.trace,
+    }
+    return step, planned.next_state, planned.new_context
+
+
+def _failure_kind(status_code: int) -> str:
+    """把模拟失败归类到 README 中承诺的 route/rule/render 三类。"""
+    if status_code in (404, 405):
+        return "route"
+    if status_code == 409:
+        return "rule"
+    return "render"
 
 
 def preview_session(token: str, method: str, path: str, query: dict[str, Any],
@@ -461,66 +549,100 @@ def preview_session(token: str, method: str, path: str, query: dict[str, Any],
         state = row["state"]
         context = json.loads(row["context"])
 
-        route, path_params, trace = _match_routes(scenario, method, path)
-
-        bag = {"state": state, "body": body, "query": query,
-               "header": headers, "path": path_params}
-        rule, rule_trace = evaluate_rules_traced(route.rules, bag)
-        trace += rule_trace
-
-        if rule is None:
-            payload: dict[str, Any] = {
-                "error": "no_matching_rule",
-                "scenario": scenario_name,
-                "route": route.id,
-                "state": state,
-                "trace": trace,
-                "preview": {"persisted": False},
-            }
-            return 409, payload
-
-        planned = _plan_matched(scenario, scenario_name, route, path_params, rule,
-                                state=state, context=context, method=method, path=path,
-                                body=body, query=query, headers=headers, trace=trace)
+        step, _next_state, _next_context = _simulate_step(
+            scenario, scenario_name, state=state, context=context,
+            method=method, path=path, query=query, headers=headers, body=body)
 
     # 事务已回滚：以下全部是基于快照的拟结果
-    seq_before = {k: context.get("_seq", {}).get(k)
-                  for k in planned.counters if k in context.get("_seq", {})}
-    seq_preview = [
-        {
-            **call,
-            "before": seq_before.get(call["name"]),
-            "note": "仅预演内自增，不会持久化；随后真实请求仍从预演前的计数开始",
-        }
-        for call in planned.seq_calls
-    ]
-
-    payload = {
-        "preview": {"persisted": False},
-        "token": token,
-        "matched": {
-            "scenario": planned.scenario_name,
-            "route": planned.route.id,
-            "rule": planned.rule.name,
-            "path_params": planned.path_params,
-        },
-        "request": {
-            "method": method,
-            "path": path,
-            "query": query,
-            "headers": headers,
-            "body": body,
-        },
-        "response": {
-            "status_code": planned.status_code,
-            "headers": planned.headers,
-            "body": planned.body,
-            "delay_ms": planned.delay_ms,
-        },
-        "state_diff": {"before": planned.state, "after": planned.next_state,
-                       "changed": planned.state != planned.next_state},
-        "context_diff": _build_diff(planned.context, planned.new_context),
-        "seq_preview": seq_preview,
-        "trace": planned.trace,
-    }
+    payload = {"preview": {"persisted": False}, "token": token, **step}
     return 200, payload
+
+
+# ---------------------------------------------------------------------------
+# 连续请求链预演：基于同一会话快照依次执行，后一步看到前一步的拟变化
+# ---------------------------------------------------------------------------
+
+def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+    """连续预演一条有序请求链，返回 (HTTP 状态码, 结构化结果)。
+
+    从会话当前快照出发在纯内存中逐步行进：每一步都能看到此前各步拟产生的
+    state、context 与 seq 计数变化。任一路由/规则/渲染失败立即停止。
+    全程只读、不落库；不改变会话快照时，重复调用结果可重复。
+    """
+    with read_tx() as conn:
+        row = conn.execute(
+            "SELECT scenario, state, context FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if row is None:
+            return 404, {
+                "error": "session_not_found", "token": token,
+                "detail": "链路预演要求会话已存在；请先创建会话或发起一次真实业务请求",
+                "preview": {"persisted": False, "chain": True},
+            }
+
+        scenario_name = row["scenario"]
+        scenario = store.get(scenario_name)
+        if scenario is None:
+            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
+        initial_state = row["state"]
+        initial_context = json.loads(row["context"])
+
+        state = initial_state
+        context = initial_context
+        steps: list[dict[str, Any]] = []
+        failed_index: int | None = None
+        failure: dict[str, Any] | None = None
+
+        for index, req in enumerate(requests):
+            try:
+                step, next_state, next_context = _simulate_step(
+                    scenario, scenario_name, state=state, context=context,
+                    method=req["method"], path=req["path"],
+                    query=req["query"], headers=req["headers"], body=req["body"])
+            except SimAbort as exc:
+                # 路由、规则或渲染失败：立即停止，仅返回此前成功步骤
+                failed_index = index
+                error_body = dict(exc.body)
+                if exc.trace is not None:
+                    error_body["trace"] = exc.trace
+                failure = {
+                    "index": index,
+                    "kind": _failure_kind(exc.status_code),
+                    "status_code": exc.status_code,
+                    "request": {
+                        "method": req["method"], "path": req["path"],
+                        "query": req["query"], "headers": req["headers"],
+                        "body": req["body"],
+                    },
+                    "error": error_body,
+                }
+                break
+
+            steps.append({"index": index, **step})
+            # 后一步基于前一步拟产生的快照继续
+            state = next_state
+            context = next_context
+
+        seq_counters = dict(context.get("_seq", {}) or {})
+
+        final_snapshot = {
+            "state": state,
+            "context": {k: v for k, v in context.items() if k != "_seq"},
+            "seq": seq_counters,
+            "note": "链路预演的拟最终快照，不会持久化；随后真实请求仍从预演前的快照开始",
+        }
+
+        payload: dict[str, Any] = {
+            "preview": {"persisted": False, "chain": True},
+            "token": token,
+            "scenario": scenario_name,
+            "steps_completed": len(steps),
+            "steps_total": len(requests),
+            "stopped": failure is not None,
+            "failed_index": failed_index,
+            "failure": failure,
+            "steps": steps,
+            "final_snapshot": final_snapshot,
+        }
+        return 200, payload

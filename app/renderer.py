@@ -100,11 +100,19 @@ class Renderer:
             # 整个值就是一个表达式：返回原生 Python 对象
             try:
                 compiled = self.env.compile_expression(expr.group(1), undefined_to_none=False)
-                return compiled(**self.context)
+                result = compiled(**self.context)
             except UndefinedError as exc:
                 raise RenderError(str(exc)) from exc
             except Exception as exc:
                 raise RenderError(f"表达式渲染失败: {exc}") from exc
+            # StrictUndefined 在整体表达式取值时不会自动抛错（仅在被使用时），
+            # 这里显式令其与嵌入式模板一样报未定义，避免返回不可序列化的对象
+            if isinstance(result, StrictUndefined):
+                try:
+                    result._fail_with_undefined_error()
+                except UndefinedError as exc:
+                    raise RenderError(str(exc)) from exc
+            return result
         try:
             return self.env.from_string(text).render(**self.context)
         except UndefinedError as exc:

@@ -24,6 +24,7 @@ docker compose up --build -d
 | 场景管理 | `http://localhost:8080/__scenarios` |
 | 会话状态 | `http://localhost:8080/__sessions/{token}` |
 | 请求预演 | `POST http://localhost:8080/__sessions/{token}/preview` |
+| 连续请求链预演 | `POST http://localhost:8080/__sessions/{token}/preview/chain` |
 | 模拟业务流量 | 除上述管理前缀外的任意路径，如 `POST http://localhost:8080/orders` |
 
 停止：`docker compose down`（数据保留在命名卷 `simulator-data` 中；加 `-v` 一并清除）。
@@ -181,6 +182,7 @@ curl -s -X PUT $BASE/__scenarios/my-scenario \
 | GET | `/__sessions/{token}` | **会话状态查询**：当前状态、上下文、可用状态、路由列表 |
 | GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧） |
 | POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异 |
+| POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
 | POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件 |
 | DELETE | `/__sessions/{token}` | 删除会话及其事件 |
 
@@ -262,6 +264,109 @@ curl -s -X POST $BASE/__sessions/t1/preview \
 `paid` 状态预演支付，预演接口信封为 `200` 但 `response.status_code` 为
 `409`，错误体与真实请求完全相同。
 
+#### 连续请求链预演（chain dry-run）
+
+在**不改动会话**的前提下，把一组**有序请求**当作一条真实调用链依次试跑：
+从该会话的当前快照出发，**后一步一定能看到前一步拟产生的 `state`、
+`context` 与 `seq` 计数变化**，用于一次性确认"我按顺序发这一串请求会发生
+什么"（如下单 → 支付 → 发货 → 收货）。
+
+- 请求体只有一个字段 `requests`：元素结构与单次预演**完全相同**（`path`
+  必填，`method` 默认 `GET`，`query`/`headers`/`body` 语义一致），**最多
+  50 步**，超出返回 422；
+- 每一步复用与单次预演/真实请求**同一份**路由匹配、规则判定与 Jinja 渲染
+  逻辑；每步返回内容与单次预演一致：`matched` / `request` / `response` /
+  `state_diff` / `context_diff` / `seq_preview` / `trace`；
+- 拟响应为错误状态码但**确实命中了规则**（如 400/409 兜底规则）属于正常
+  模拟响应，链路继续；只有**路由失败**（404/405）、**无规则命中**（409
+  `no_matching_rule`）或**渲染失败**（500 `render_error`）才会立即停止，
+  返回 `failed_index`、失败类型 `failure.kind`（`route`/`rule`/`render`）、
+  失败请求与错误体（含 `trace`），以及此前已成功的各步；
+- 全程在只读事务中执行并最终回滚：**不写 sessions、不写 events、不推进序列
+  计数**；`seq()` 只在预演内存中沿链路自增（后一步看得到、库中不保留），
+  会话快照不变时**多次调用结果可重复**（模板内的 `now()`/`uuid4()` 与单次
+  预演一样是运行时值）；
+- 同样要求会话**已存在**，不存在返回 404。
+
+```bash
+# 新建一个 init 状态的会话
+curl -s -X POST $BASE/__sessions -H 'Content-Type: application/json' \
+  -d '{"token":"c1","state":"init"}'
+
+# 连续预演：下单 -> 支付 -> 发货 -> 收货
+curl -s -X POST $BASE/__sessions/c1/preview/chain \
+  -H 'Content-Type: application/json' -d '{
+    "requests": [
+      {"method":"POST","path":"/orders","body":{"sku":"A-1","quantity":2}},
+      {"method":"POST","path":"/orders/1000/pay","body":{"channel":"alipay"}},
+      {"method":"POST","path":"/orders/1000/ship","body":{"carrier":"sf"}},
+      {"method":"POST","path":"/orders/1000/confirm"}
+    ]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "preview": {"persisted": false, "chain": true},
+  "token": "c1",
+  "scenario": "order-flow",
+  "steps_completed": 4,
+  "steps_total": 4,
+  "stopped": false,
+  "failed_index": null,
+  "failure": null,
+  "steps": [
+    {"index": 0, "matched": {"scenario": "order-flow", "route": "create-order",
+                             "rule": "create-success", "path_params": {}},
+     "response": {"status_code": 201, "headers": {}, "body": {"...": "..."},
+                  "delay_ms": 0},
+     "state_diff": {"before": "init", "after": "created", "changed": true},
+     "context_diff": {"added": {"sku": "A-1", "quantity": 2},
+                      "changed": {}, "removed": []},
+     "seq_preview": [{"name": "order", "start": 1000, "value": 1000,
+                      "existed": false, "before": null}],
+     "trace": [ {"...": "与单次预演相同的逐条件轨迹..."} ]},
+    {"index": 1, "state_diff": {"before": "created", "after": "paid",
+                                "changed": true}, "...": "..."},
+    {"index": 2, "state_diff": {"before": "paid", "after": "shipped",
+                                "changed": true}, "...": "..."},
+    {"index": 3, "state_diff": {"before": "shipped", "after": "completed",
+                                "changed": true}, "...": "..."}
+  ],
+  "final_snapshot": {
+    "state": "completed",
+    "context": {"sku": "A-1", "quantity": 2, "pay_channel": "alipay",
+                "carrier": "sf"},
+    "seq": {"order": 1001},
+    "note": "链路预演的拟最终快照，不会持久化；随后真实请求仍从预演前的快照开始"
+  }
+}
+```
+
+链中途失败时，HTTP 信封仍为 `200`，但 `stopped` 为 `true`、
+`steps_completed` 只含失败前的成功步骤数，例如第 2 步打了一个不存在的路径：
+
+```json
+{
+  "steps_completed": 1,
+  "steps_total": 2,
+  "stopped": true,
+  "failed_index": 1,
+  "failure": {
+    "index": 1,
+    "kind": "route",
+    "status_code": 404,
+    "request": {"method": "GET", "path": "/ghost/9", "query": {},
+                "headers": {}, "body": {}},
+    "error": {"error": "no_route", "path": "/ghost/9", "trace": [ "..."]}
+  },
+  "steps": [ {"index": 0, "...": "失败前的成功步骤..."} ],
+  "final_snapshot": {"state": "created", "context": {"...": "..."}, "seq": {}}
+}
+```
+
 会话也可以**懒创建**：业务请求只需携带令牌；首个匹配到路由的请求自动建会话。
 当已载入多个场景时，懒创建需通过请求头 `sim-scenario: <name>` 指定场景
 （或设置环境变量 `SIM_DEFAULT_SCENARIO`）。
@@ -330,11 +435,11 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── models.py          # 场景/路由/规则数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染与模板函数
-│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；同快照只读请求预演（零副作用）
+│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；同快照只读单请求/请求链预演（零副作用）
 │   ├── store.py           # 已编译场景缓存
 │   └── routers/
 │       ├── scenarios.py   # 场景校验/载入/查询/删除
-│       └── sessions.py    # 会话创建/状态查询/重置/事件/请求预演
+│       └── sessions.py    # 会话创建/状态查询/重置/事件/单请求与请求链预演
 ├── scenarios/
 │   └── order-flow.yaml    # 示例场景（随启动自动加载）
 ├── requirements.txt
