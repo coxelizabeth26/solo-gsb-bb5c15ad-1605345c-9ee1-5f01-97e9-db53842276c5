@@ -1,4 +1,4 @@
-"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史 / 请求预演。"""
+"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史 / 请求预演 / 连续请求链预演。"""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from ..db import dumps, get_conn, write_tx
-from ..engine import SimAbort, preview_session
+from ..engine import MAX_CHAIN_STEPS, SimAbort, preview_chain, preview_session
 from ..store import store
 
 router = APIRouter(prefix="/__sessions", tags=["sessions"])
@@ -202,6 +202,51 @@ async def preview_request(token: str, body: PreviewBody) -> JSONResponse:
     except SimAbort as exc:
         # 与真实请求一致的状态码和错误详情（404 无路由 / 405 方法不允许 /
         # 410 场景已卸载 / 500 渲染错误等），并附判定轨迹
+        payload = dict(exc.body)
+        if exc.trace is not None:
+            payload["trace"] = exc.trace
+        payload["preview"] = {"persisted": False}
+        status_code = exc.status_code
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+class ChainPreviewBody(BaseModel):
+    requests: list[PreviewBody] = Field(
+        description=(f"有序业务请求数组，按序依次预演；1..{MAX_CHAIN_STEPS} 个，"
+                     "后一步基于前一步拟产生的快照继续"))
+
+    @field_validator("requests")
+    @classmethod
+    def _validate_requests(cls, value: list[PreviewBody]) -> list[PreviewBody]:
+        if not value:
+            raise ValueError("requests 至少包含一个请求")
+        if len(value) > MAX_CHAIN_STEPS:
+            raise ValueError(f"连续预演最多 {MAX_CHAIN_STEPS} 步，收到 {len(value)} 个")
+        return value
+
+
+@router.post("/{token}/preview-chain")
+async def preview_request_chain(token: str, body: ChainPreviewBody) -> JSONResponse:
+    """**连续请求链预演**：基于会话快照依次执行有序请求，不落库、不耗序列计数。
+
+    后一步看到前一步拟产生的 state/context/seq；任一步路由、规则或渲染
+    失败立即停止，返回失败步骤下标与此前各步结果。
+    """
+    requests = [
+        {
+            "method": request.method or "GET",
+            "path": request.path,
+            "query": request.query or {},
+            "headers": request.headers or {},
+            "body": request.body if request.body is not None else {},
+        }
+        for request in body.requests
+    ]
+
+    try:
+        status_code, payload = preview_chain(token=token, requests=requests)
+    except SimAbort as exc:
+        # 未在链路中归类的终止（如 410 场景已卸载）：与单请求预演一致
         payload = dict(exc.body)
         if exc.trace is not None:
             payload["trace"] = exc.trace
